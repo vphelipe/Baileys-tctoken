@@ -1579,6 +1579,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			return
 		}
 
+		// ── Error 475: NewChatMessagesCapped — do NOT retry (ban risk) ──
+		if (errorCode === '475') {
+			logger.warn({ msgId, from }, 'NewChatMessagesCapped (475) — do NOT retry')
+			ev.emit('messages.update', [{
+				key,
+				update: { status: WAMessageStatus.ERROR, messageStubParameters: [errorCode] }
+			}])
+			return
+		}
+
 		// ── Error 479: SmaxInvalid — warn only, do not retry ──
 		if (errorCode === '479') {
 			logger.warn({ msgId, from }, 'SmaxInvalid (479) — message may not be delivered')
@@ -1690,10 +1700,18 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	})
 
-	ev.on('connection.update', ({ isOnline }) => {
+	ev.on('connection.update', ({ connection, isOnline }) => {
 		if (typeof isOnline !== 'undefined') {
 			sendActiveReceipts = isOnline
 			logger.trace(`sendActiveReceipts set to "${sendActiveReceipts}"`)
+		}
+
+		// Cleanup transient state on disconnect
+		if (connection === 'close') {
+			retriedMsgIds.clear()
+			if (tcTokenPruneInterval) {
+				clearInterval(tcTokenPruneInterval)
+			}
 		}
 	})
 

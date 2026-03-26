@@ -75,9 +75,18 @@ After every successful 1:1 send, if `shouldSendNewTcToken()` returns true (bucke
 - Extracts salt and emits via `creds.update` for persistence
 - Used by `computeCsToken()` for CS token fallback
 
-### 11. Error 479 Handling (`messages-recv.ts`)
+### 11. Error 475 Handling (`messages-recv.ts`)
+
+- NewChatMessagesCapped: Emits ERROR status, does NOT retry (risk of ban escalation to 402)
+
+### 12. Error 479 Handling (`messages-recv.ts`)
 
 - SmaxInvalid: Logged as warning, no retry (message may not be delivered)
+
+### 13. Connection Close Cleanup (`messages-recv.ts`)
+
+- Clears `retriedMsgIds` set on disconnect to free memory
+- Clears `tcTokenPruneInterval` to prevent stale timers
 
 ## Token Lifecycle
 
