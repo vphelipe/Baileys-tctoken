@@ -52,6 +52,7 @@ import {
 import { makeMutex } from '../Utils/make-mutex'
 import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
 import { buildAckStanza } from '../Utils/stanza-ack'
+import { storeTcTokensFromNotification, waitForTcToken } from '../Utils/tc-token-utils'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -864,32 +865,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	const handlePrivacyTokenNotification = async (node: BinaryNode) => {
-		const tokensNode = getBinaryNodeChild(node, 'tokens')
-		const from = jidNormalizedUser(node.attrs.from)
+		const storedCount = await storeTcTokensFromNotification({
+			node,
+			keys: authState.keys,
+		})
 
-		if (!tokensNode) return
-
-		const tokenNodes = getBinaryNodeChildren(tokensNode, 'token')
-
-		for (const tokenNode of tokenNodes) {
-			const { attrs, content } = tokenNode
-			const type = attrs.type
-			const timestamp = attrs.t
-
-			if (type === 'trusted_contact' && content instanceof Buffer) {
-				logger.debug(
-					{
-						from,
-						timestamp,
-						tcToken: content
-					},
-					'received trusted contact token'
-				)
-
-				await authState.keys.set({
-					tctoken: { [from]: { token: content, timestamp } }
-				})
-			}
+		if (storedCount > 0) {
+			logger.debug(
+				{ from: node.attrs.from, storedCount },
+				'stored privacy tokens from notification'
+			)
 		}
 	}
 
@@ -1435,51 +1420,150 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
+	/**
+	 * Set of message IDs that have already been retried after error 463/421.
+	 * Prevents infinite retry loops — each message gets at most ONE retry.
+	 */
+	const retriedMsgIds = new Set<string>()
+
+	/**
+	 * Handle bad ack (error responses to sent messages).
+	 *
+	 * Error codes from WA server:
+	 * - 421 = StaleGroupAddressingMode — group metadata stale, refetch & retry
+	 * - 429 = RateOverlimit — server rate limiting, emit error (do NOT retry)
+	 * - 463 = MissingTcToken — privacy token missing, fetch token & retry once
+	 * - 475 = NewChatMessagesCapped — new chat restriction, emit error
+	 */
 	const handleBadAck = async ({ attrs }: BinaryNode) => {
-		const key: WAMessageKey = { remoteJid: attrs.from, fromMe: true, id: attrs.id }
+		const errorCode = attrs.error
+		const from = attrs.from!
+		const msgId = attrs.id!
+		const key: WAMessageKey = { remoteJid: from, fromMe: true, id: msgId }
 
-		// WARNING: REFRAIN FROM ENABLING THIS FOR NOW. IT WILL CAUSE A LOOP
-		// // current hypothesis is that if pash is sent in the ack
-		// // it means -- the message hasn't reached all devices yet
-		// // we'll retry sending the message here
-		// if(attrs.phash) {
-		// 	logger.info({ attrs }, 'received phash in ack, resending message...')
-		// 	const msg = await getMessage(key)
-		// 	if(msg) {
-		// 		await relayMessage(key.remoteJid!, msg, { messageId: key.id!, useUserDevicesCache: false })
-		// 	} else {
-		// 		logger.warn({ attrs }, 'could not send message again, as it was not found')
-		// 	}
-		// }
+		if (!errorCode) return
 
-		// error in acknowledgement,
-		// device could not display the message
-		if (attrs.error) {
-			logger.warn({ attrs }, 'received error in ack')
-			ev.emit('messages.update', [
-				{
-					key,
-					update: {
-						status: WAMessageStatus.ERROR,
-						messageStubParameters: [attrs.error]
-					}
-				}
-			])
-
-			// resend the message with device_fanout=false, use at your own risk
-			// if (attrs.error === '475') {
-			// 	const msg = await getMessage(key)
-			// 	if (msg) {
-			// 		await relayMessage(key.remoteJid!, msg, {
-			// 			messageId: key.id!,
-			// 			useUserDevicesCache: false,
-			// 			additionalAttributes: {
-			// 				device_fanout: 'false'
-			// 			}
-			// 		})
-			// 	}
-			// }
+		// ── Error 429: Rate limit — never retry, just emit error ──
+		if (errorCode === '429') {
+			logger.warn({ msgId, from }, 'rate limited by server (429)')
+			ev.emit('messages.update', [{
+				key,
+				update: { status: WAMessageStatus.ERROR, messageStubParameters: [errorCode] }
+			}])
+			return
 		}
+
+		// ── Error 421: Stale group addressing mode — refetch group & retry ──
+		if (errorCode === '421' && isJidGroup(from)) {
+			if (retriedMsgIds.has(msgId)) {
+				logger.debug({ msgId, from }, 'already retried 421, ignoring')
+				return
+			}
+
+			retriedMsgIds.add(msgId)
+			logger.info({ msgId, from }, 'stale group addressing (421), invalidating cache & retrying')
+
+			try {
+				const cachedMsg = messageRetryManager
+					? messageRetryManager.getRecentMessage(from, msgId)?.message
+					: await getMessage(key)
+
+				if (cachedMsg) {
+					await relayMessage(from, cachedMsg, {
+						messageId: msgId,
+						useUserDevicesCache: false
+					})
+					logger.info({ msgId, from }, '421 retry successful')
+				} else {
+					logger.warn({ msgId, from }, '421 retry failed: message not found in cache')
+				}
+			} catch (err: any) {
+				logger.warn({ msgId, from, err: err.message }, '421 retry failed')
+			}
+
+			return
+		}
+
+		// ── Remaining errors: only handle for 1:1 chats (not groups) ──
+		if (isJidGroup(from) || isJidNewsletter(from) || isJidStatusBroadcast(from)) {
+			// For non-1:1, just emit error status
+			ev.emit('messages.update', [{
+				key,
+				update: { status: WAMessageStatus.ERROR, messageStubParameters: [errorCode] }
+			}])
+			return
+		}
+
+		// ── Error 463: Missing TC Token — fetch token, wait, retry ──
+		if (errorCode === '463') {
+			if (retriedMsgIds.has(msgId)) {
+				logger.debug({ msgId, from }, 'already retried 463, ignoring')
+				return
+			}
+
+			retriedMsgIds.add(msgId)
+
+			// Cleanup old retried IDs to prevent memory leak (keep max 1000)
+			if (retriedMsgIds.size > 1000) {
+				const iter = retriedMsgIds.values()
+				for (let i = 0; i < 500; i++) {
+					retriedMsgIds.delete(iter.next().value!)
+				}
+			}
+
+			logger.info({ msgId, from }, 'MissingTcToken (463) — starting recovery')
+
+			try {
+				// Step 1: Request privacy tokens from server
+				try {
+					await sock.getPrivacyTokens([from])
+					logger.debug({ from }, '463: privacy token IQ sent')
+				} catch (iqErr: any) {
+					logger.debug({ from, err: iqErr.message }, '463: privacy token IQ failed')
+				}
+
+				// Step 2: Wait for async token arrival (up to 3s)
+				const tokenResult = await waitForTcToken({
+					authState,
+					jid: from,
+					maxWaitMs: 3000,
+					pollIntervalMs: 200
+				})
+
+				if (tokenResult) {
+					logger.debug({ from }, '463: token received')
+				} else {
+					logger.debug({ from }, '463: token NOT received, retrying anyway')
+				}
+
+				// Step 3: Retrieve and retry the message
+				let cachedMsg = messageRetryManager
+					? messageRetryManager.getRecentMessage(from, msgId)?.message
+					: null
+
+				if (!cachedMsg) {
+					cachedMsg = await getMessage({ ...key, id: msgId }) || null
+				}
+
+				if (cachedMsg) {
+					await relayMessage(from, cachedMsg, { messageId: msgId })
+					logger.info({ msgId, from }, '463 retry successful')
+				} else {
+					logger.warn({ msgId, from }, '463 retry failed: message not found')
+				}
+			} catch (retryErr: any) {
+				logger.warn({ msgId, from, err: retryErr.message }, '463 retry failed')
+			}
+
+			return
+		}
+
+		// ── All other errors: emit error status ──
+		logger.warn({ attrs }, 'received error in ack')
+		ev.emit('messages.update', [{
+			key,
+			update: { status: WAMessageStatus.ERROR, messageStubParameters: [errorCode] }
+		}])
 	}
 
 	/// processes a node with the given function

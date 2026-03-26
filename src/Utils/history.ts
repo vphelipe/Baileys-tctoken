@@ -133,6 +133,7 @@ export const processHistoryMessage = (item: proto.IHistorySync, logger?: ILogger
 		contacts,
 		messages,
 		lidPnMappings,
+		nctSalt: (item as any).nctSalt ? new Uint8Array((item as any).nctSalt) : undefined,
 		syncType: item.syncType,
 		progress: item.progress
 	}
