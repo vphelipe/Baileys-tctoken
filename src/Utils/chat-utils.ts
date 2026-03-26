@@ -873,6 +873,13 @@ export const processSyncAction = (
 		if (!isInitialSync) {
 			ev.emit('chats.delete', [id!])
 		}
+	} else if ((action as any)?.nctSaltSyncAction) {
+		const salt = (action as any).nctSaltSyncAction.salt
+		if (salt && salt.length) {
+			ev.emit('creds.update', { nctSalt: new Uint8Array(salt) })
+		} else {
+			ev.emit('creds.update', { nctSalt: undefined })
+		}
 	} else if (action?.labelEditAction) {
 		const { name, color, deleted, predefinedId } = action.labelEditAction
 

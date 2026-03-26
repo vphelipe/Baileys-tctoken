@@ -59,7 +59,25 @@ After every successful 1:1 send, if `shouldSendNewTcToken()` returns true (bucke
 
 - **Monotonicity guard**: Rejects tokens with older timestamps than existing ones
 - **Callback**: `onNewJidStored` for tracking new token arrivals
+- **Buffer/Uint8Array**: Accepts both `Buffer` and `Uint8Array` token content
 - Returns count of stored tokens for logging
+
+### 9. Periodic TC Token Pruning (`tc-token-utils.ts` + `messages-recv.ts`)
+
+- **`pruneExpiredTcTokens(keys, knownJids)`**: Iterates known JIDs, deletes expired tokens
+- **6-hour interval**: Periodic cleanup via `setInterval` (with `.unref()` to not keep Node alive)
+- **`tcTokenKnownJids`**: Set tracking JIDs with stored tokens, updated via `onNewJidStored` callback
+- Prevents memory leaks from accumulated expired tokens
+
+### 10. NCT Salt Sync Action (`chat-utils.ts`)
+
+- Handles `nctSaltSyncAction` in `processSyncAction()`
+- Extracts salt and emits via `creds.update` for persistence
+- Used by `computeCsToken()` for CS token fallback
+
+### 11. Error 479 Handling (`messages-recv.ts`)
+
+- SmaxInvalid: Logged as warning, no retry (message may not be delivered)
 
 ## Token Lifecycle
 
@@ -100,7 +118,8 @@ After every successful 1:1 send, if `shouldSendNewTcToken()` returns true (bucke
 |------|---------|
 | `src/Utils/tc-token-utils.ts` | Complete rewrite: expiration, cstoken, wait, store |
 | `src/Socket/messages-send.ts` | cstoken fallback, fire-and-forget re-issuance |
-| `src/Socket/messages-recv.ts` | Error 463/421/429 handling in handleBadAck |
+| `src/Socket/messages-recv.ts` | Error 463/421/429/479 handling, TC token pruning |
+| `src/Utils/chat-utils.ts` | nctSaltSyncAction handler |
 | `src/Socket/chats.ts` | Updated buildTcTokenFromJid call sites |
 | `src/Types/Auth.ts` | Added nctSalt to AuthenticationCreds |
 | `src/Utils/auth-utils.ts` | Added nctSalt to initAuthCreds |

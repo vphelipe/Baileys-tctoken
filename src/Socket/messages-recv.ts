@@ -52,7 +52,7 @@ import {
 import { makeMutex } from '../Utils/make-mutex'
 import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
 import { buildAckStanza } from '../Utils/stanza-ack'
-import { storeTcTokensFromNotification, waitForTcToken } from '../Utils/tc-token-utils'
+import { storeTcTokensFromNotification, waitForTcToken, pruneExpiredTcTokens } from '../Utils/tc-token-utils'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -868,6 +868,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const storedCount = await storeTcTokensFromNotification({
 			node,
 			keys: authState.keys,
+			onNewJidStored: (jid) => tcTokenKnownJids.add(jid)
 		})
 
 		if (storedCount > 0) {
@@ -1426,6 +1427,25 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	 */
 	const retriedMsgIds = new Set<string>()
 
+	/** Track JIDs with known TC tokens for periodic pruning */
+	const tcTokenKnownJids = new Set<string>()
+
+	/** Periodic TC token pruning (every 6 hours) */
+	const tcTokenPruneInterval = setInterval(async () => {
+		try {
+			const pruned = await pruneExpiredTcTokens(authState.keys, tcTokenKnownJids)
+			if (pruned > 0) {
+				logger.debug({ pruned }, 'pruned expired TC tokens')
+			}
+		} catch {
+			// ignore pruning errors
+		}
+	}, 6 * 60 * 60 * 1000)
+	// Prevent interval from keeping Node alive
+	if (tcTokenPruneInterval?.unref) {
+		tcTokenPruneInterval.unref()
+	}
+
 	/**
 	 * Handle bad ack (error responses to sent messages).
 	 *
@@ -1434,6 +1454,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	 * - 429 = RateOverlimit — server rate limiting, emit error (do NOT retry)
 	 * - 463 = MissingTcToken — privacy token missing, fetch token & retry once
 	 * - 475 = NewChatMessagesCapped — new chat restriction, emit error
+	 * - 479 = SmaxInvalid — warn only, message may not be delivered
 	 */
 	const handleBadAck = async ({ attrs }: BinaryNode) => {
 		const errorCode = attrs.error
@@ -1555,6 +1576,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				logger.warn({ msgId, from, err: retryErr.message }, '463 retry failed')
 			}
 
+			return
+		}
+
+		// ── Error 479: SmaxInvalid — warn only, do not retry ──
+		if (errorCode === '479') {
+			logger.warn({ msgId, from }, 'SmaxInvalid (479) — message may not be delivered')
 			return
 		}
 

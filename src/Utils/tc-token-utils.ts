@@ -165,9 +165,12 @@ export async function storeTcTokensFromNotification({
 		const type = attrs.type
 		const timestamp = attrs.t
 
-		if (type !== 'trusted_contact' || !(content instanceof Buffer)) {
+		if (type !== 'trusted_contact' || !(Buffer.isBuffer(content) || content instanceof Uint8Array)) {
 			continue
 		}
+
+		// Ensure we store as Buffer for consistency
+		const tokenBuffer = Buffer.isBuffer(content) ? content : Buffer.from(content)
 
 		// Monotonicity guard: reject older tokens
 		const incomingTs = timestamp ? parseInt(String(timestamp), 10) : 0
@@ -187,7 +190,7 @@ export async function storeTcTokensFromNotification({
 		}
 
 		await keys.set({
-			tctoken: { [from]: { token: content, timestamp: timestamp || String(incomingTs) } }
+			tctoken: { [from]: { token: tokenBuffer, timestamp: timestamp || String(incomingTs) } }
 		})
 
 		storedCount++
@@ -208,4 +211,33 @@ export function computeCsToken(nctSalt: Uint8Array | Buffer, recipientLid: strin
 	const hmac = createHmac('sha256', Buffer.from(nctSalt))
 	hmac.update(recipientLid, 'utf8')
 	return new Uint8Array(hmac.digest())
+}
+
+/**
+ * Prune expired TC tokens from the key store.
+ * Iterates over a set of known JIDs and removes any tokens that are expired.
+ * Should be called periodically to prevent memory leaks from accumulated tokens.
+ */
+export async function pruneExpiredTcTokens(
+	keys: SignalKeyStoreWithTransaction,
+	knownJids: Set<string>
+): Promise<number> {
+	let pruned = 0
+
+	for (const jid of knownJids) {
+		try {
+			const data = await keys.get('tctoken', [jid])
+			const tokenData = data?.[jid]
+
+			if (tokenData?.timestamp && isTcTokenExpired(tokenData.timestamp)) {
+				await keys.set({ tctoken: { [jid]: null } })
+				knownJids.delete(jid)
+				pruned++
+			}
+		} catch {
+			// ignore errors during pruning
+		}
+	}
+
+	return pruned
 }
